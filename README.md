@@ -227,6 +227,58 @@ Inspired by [s60sc/ESP32_AdBlocker](https://github.com/s60sc/ESP32_AdBlocker) �
 "answer 0.0.0.0 for blocklisted domains" idea. This is an independent from-scratch
 implementation focused on the hash-in-flash optimization for PSRAM-less chips.
 
+## ESP32-C6-Pico port (this branch)
+
+This branch adapts the project for the **Waveshare ESP32-C6-Pico** (ESP32-C6-MINI-1, 4 MB flash, no PSRAM).
+
+- PlatformIO env: `c6` (`board = esp32-c6-devkitm-1`, the closest available board definition; flash size 4 MB matches).
+- USB console: native USB Serial/JTAG (`ARDUINO_USB_MODE=1`, `ARDUINO_USB_CDC_ON_BOOT=1`).
+- BOOT button: GPIO9 (verified against the Waveshare schematic).
+- Partition layout enlarged app slots to 1.5 MB each (toolchain produces ~1.42 MB firmware); blocklist partition ~0.94 MB (~188k domains).
+- mDNS/AP/OTA host renamed to `c6adblock` / `C6-AdBlock`.
+
+### macOS build & flash
+
+```bash
+# 1. secrets
+cp src/secrets.example.h src/secrets.h   # then edit
+
+# 2. blocklist
+python3 tools/build_blocklist.py data/blocklist.bin
+
+# 3. build
+pio run -e c6
+
+# 4. find port
+pio device list
+
+# 5. flash (confirm port first; never auto-flash)
+pio run -e c6 -t upload --upload-port /dev/cu.usbmodemXXXX
+
+# 6. filesystem (blocklist)
+pio run -e c6 -t uploadfs --upload-port /dev/cu.usbmodemXXXX
+
+# 7. monitor
+pio device monitor -p /dev/cu.usbmodemXXXX -b 115200
+```
+
+### Router DNS
+
+USB power does **not** configure router DNS. Point clients (or the router's DHCP DNS option) at the board's IP, e.g. `192.168.x.x`. Test:
+`dig @<board-ip> doubleclick.net` (expect 0.0.0.0), `dig @<board-ip> github.com` (real IP).
+
+### Safe test plan
+1. Flash and boot; confirm `c6adblock.local` dashboard loads.
+2. `dig @<ip> doubleclick.net` → 0.0.0.0; `dig @<ip> github.com` → real IP.
+3. Add a custom block domain via dashboard; verify sinkhole.
+4. Disconnect/reconnect WiFi; confirm recovery and no crash.
+5. OTA: upload a rebuilt firmware.bin via dashboard; confirm reboot.
+
+### Known limitations
+- Board ID is the Espressif devkit (Waveshare not yet in PlatformIO); flash size assumed 4 MB (verify with `esptool flash_id`).
+- Blocklist capacity reduced to ~188k domains due to larger firmware.
+- Plain HTTP dashboard on :80 (LAN trust boundary, as upstream).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
