@@ -1,284 +1,252 @@
-# esp32-c3-adblock
+# ESP32-C6 AdBlock
 
-[日本語 README](README_JP.md)
+A DNS-based ad and tracker blocker adapted for the **ESP32-C6**, initially targeting the **Waveshare ESP32-C6-Pico**.
 
-A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM required*.
+This project filters DNS queries on the local network. Devices that use the ESP32 as their DNS resolver receive `0.0.0.0` for blocked domains and real answers for everything else. It is a network-level filter, not a browser extension: it cannot remove ads served from the same domain as legitimate content, and it cannot affect traffic that does not use DNS.
 
-> 📰 Featured on [Tom's Hardware](https://www.tomshardware.com/networking/clever-hacker-fits-537-000-domains-in-a-tiny-usd5-esp32-ad-blocking-dongle-firmware-uses-only-around-50kb-of-ram-and-can-answer-blocked-lookups-in-10-milliseconds), [XDA Developers](https://www.xda-developers.com/this-tiny-esp32-powered-gadget-blocks-537000-domains-only-uses-50kb-of-ram/), and [Korben](https://korben.info/en/half-million-ad-blocking-domains-50kb-ram-esp32.html).
+This repository is adapted from the original ESP32-C3 project by M-Abozaid: https://github.com/M-Abozaid/esp32-c3-adblock
 
-The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
-domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
-fit in ~0.7 MB of flash and are matched in ~10 ms, using **~50 KB of RAM**.
+## Features
 
-```
-query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
-         ──▶ binary-search the flash hash table
-              ├─ hit  ──▶ answer 0.0.0.0   (sinkholed)
-              └─ miss ──▶ forward to upstream resolver, relay the reply
-```
+Verified in the current source:
 
-## Why this is interesting
+- DNS query parsing and forwarding to an upstream resolver (Quad9 by default).
+- Domain blocking using a sorted 40-bit FNV-1a hash table stored in flash.
+- Parent-domain matching, so a blocked domain also blocks its subdomains.
+- Custom blocked domains stored on LittleFS; allow rules are applied at blocklist build time.
+- Per-client statistics and a banned-client list.
+- Captive-portal Wi-Fi provisioning (open access point + web form).
+- Web dashboard with system metrics (IP, RSSI, temperature, free heap, uptime).
+- HTTP Basic Authentication and CSRF protection on state-changing endpoints.
+- Blocklist upload and remote auto-update over Wi-Fi.
+- Firmware OTA over Wi-Fi.
+- Non-blocking DNS forwarding with up to 8 pending upstream queries.
+- Wi-Fi reconnection with bounded backoff.
+- Task watchdog (8 s) and reset-reason logging.
+- EDNS query forwarding (upstream replies preserved).
 
-Most ESP32 DNS sinkholes load the blocklist (domain *strings*) into RAM, so they
-demand PSRAM. This project stores fixed **5-byte (40-bit) hashes in flash** instead:
+Implemented but not yet verified on physical hardware beyond the initial port:
 
-| | string-in-RAM approach | this (hash-in-flash) |
-|---|---|---|
-| Hardware | ESP32 + PSRAM (~$8) | ESP32-C3, no PSRAM (~$2) |
-| 141k domains | ~2.5 MB of RAM | **0.67 MB of flash** |
-| RAM used | most of it | **~50 KB** |
-| Lookup | string compare | ~18 flash reads (~10 ms incl. WiFi RTT) |
-| Collisions | n/a | 0 at 141k (1 at 537k) |
+- OTA end-to-end after the C6 stability changes.
+- Captive portal under the new watchdog configuration.
+- Thermal behaviour under sustained load.
 
-**Why 40 bits?** It's the sweet spot for this flash budget. Collisions follow the
-birthday bound — at 141k domains you get ~0, at 537k about 1 (i.e. one unlucky
-domain gets over-blocked). Dropping to 32 bits would save 20% of the flash but
-cost ~7 collisions at 250k; going to 64 bits wastes 3 bytes per domain to solve
-a problem you don't have.
+## Hardware compatibility
 
-The same trick works on bigger chips — it isn't a C3 workaround. On a 16 MB
-ESP32-S3 these hashes hold **~2.7M domains** vs ~466k for strings in 8 MB of
-PSRAM. Hashes in flash beat strings in PSRAM basically everywhere; the C3 just
-makes it undeniable.
+Tested hardware:
 
-## Hardware
+| Board | MCU | Flash | Status |
+|---|---|---|---|
+| Waveshare ESP32-C6-Pico | ESP32-C6FH4 | 4 MB | Verified |
 
-- Any **ESP32-C3** board (tested on a C3 SuperMini), 4 MB flash, **no PSRAM needed**
-- Classic **ESP32** (DevKit / WROOM, 4 MB) also builds: `pio run -e esp32dev -t upload` (community-contributed, compile-tested; the C3 is the tested target)
-- Power it from a **stable USB source** (a phone charger or your router's USB port).
-  Cheap/loose USB-C→A adapters can brown out the radio during WiFi transmit.
-- A **USB-A → USB-C dongle** lets it plug straight into the spare USB port on the
-  back of most routers — no power supply, no extra box.
+Other ESP32-C6 boards with 4 MB flash and a native USB Serial/JTAG port may work, but only the Waveshare board above has been tested. The ESP32-C6 supports 2.4 GHz Wi-Fi only; it cannot join a 5 GHz-only network.
 
-### Enclosure
+## Requirements
 
-A printable case for the C3 SuperMini: [`hardware/esp32-c3-supermini-enclosure.stl`](hardware/esp32-c3-supermini-enclosure.stl)
+- Waveshare ESP32-C6-Pico (or compatible ESP32-C6 board with 4 MB flash)
+- USB-C data cable (not charge-only)
+- Git
+- Python 3
+- PlatformIO Core
 
-Printing notes:
-- No supports needed; 0.2 mm layers, ~15% infill is plenty.
-- **Keep the antenna end clear.** The C3's PCB antenna is the zig-zag trace on the
-  short edge opposite the USB-C port — don't bury it in solid plastic or put metal
-  near it, or your RSSI will suffer.
-- Leave the vents open: the board idles around 45–55 °C.
+Install PlatformIO Core using the official documentation: https://docs.platformio.org/en/latest/core/installation/index.html
 
-## Build & flash (PlatformIO)
-
-One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
-
-> ⚠️ Use a **current PlatformIO** — the VSCode PlatformIO extension's bundled core, or
-> `pip install -U platformio` in a venv. The distro/apt `platformio` package (e.g. 4.3.4) is
-> too old and fails with `AttributeError: ... 'resultcallback'` (issue #4). A one-click browser installer is on the way (hosting TBD).
+On macOS, PlatformIO can be installed with pipx:
 
 ```bash
-# 1. copy the secrets template (gitignored, stays local) and edit it:
-#    - WIFI_SSID / WIFI_PASS are optional — leave the placeholders and use the
-#      on-device setup portal instead (below).
-#    - WEB_USER / WEB_PASS / OTA_PASS are NOT optional: they gate the dashboard's
-#      state-changing endpoints (/ban, /addblock, /upload, /update, /setupdate,
-#      /forgetwifi) and network OTA. Pick real values — these used to be wide
-#      open to anyone on the LAN.
+brew install pipx
+pipx install platformio
+pipx ensurepath
+```
+
+## Clone the repository
+
+```bash
+git clone https://github.com/neohackt/esp32-c6-adblock.git
+cd esp32-c6-adblock
+```
+
+## Configure Wi-Fi safely
+
+The tracked template is `src/secrets.example.h`. Copy it locally and edit the copy:
+
+```bash
 cp src/secrets.example.h src/secrets.h
-#    then edit src/secrets.h
-
-# 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
-#    ~100k entries, WhatsApp/social safe)
-python3 tools/build_blocklist.py data/blocklist.bin
-
-# 3. flash firmware + the blocklist filesystem (the one and only USB flash)
-pio run -t upload
-pio run -t uploadfs
-
-# 4. watch it boot, note the IP / open the dashboard
-pio device monitor          # -> http://c3adblock.local
 ```
 
-### Your own blocklists
+Edit `src/secrets.h` and set at least `WEB_USER`, `WEB_PASS`, and `OTA_PASS` to non-placeholder values. `WIFI_SSID` and `WIFI_PASS` are optional: leave the placeholders and use the on-device captive portal instead.
 
-`build_blocklist.py OUT.bin [SOURCE ...]` takes any mix of URLs and local files, in any of
-these formats:
+`src/secrets.h` is gitignored and must never be committed. Do not commit real credentials.
 
-- **hosts files** — `0.0.0.0 ads.example.com tracker.example.com` (all domains on the line are included)
-- **plain domain lists** — one domain per line
-- **AdGuard / Adblock basic rules** — `||ads.example.com^` blocks, `@@||ok.example.com^`
-  removes a domain (e.g. to mirror an AdGuard Home allowlist)
+If no valid Wi-Fi credentials are present, the device starts an open access point named `C6-AdBlock-XXXX` with a captive portal at `http://192.168.4.1`. Join it from a phone, select your network, and enter the password. The device then restarts and joins that network.
 
-A blocked domain also blocks its subdomains. Rules a DNS hash list can't express (regex,
-wildcards, `$` modifiers, cosmetic `##` rules) are skipped and counted. An `@@` rule only
-un-blocks that exact entry — it can't carve a subdomain out of a blocked parent. If a source
-can't be downloaded the build stops instead of silently producing a smaller list
-(`--allow-missing` to override).
+## Compile the firmware
 
-### WiFi setup (no re-flash needed)
-
-If it can't connect (or you never set `secrets.h`), it starts an open access point
-**`C3-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
-type the password, done. To move it to a new network later: click **Forget WiFi** on
-the dashboard, or hold the **BOOT** button while powering on, and the setup portal
-comes back. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
-just visit — see Security below.)
-
-## Over-the-air updates (no more USB)
-
-The dashboard at **http://c3adblock.local** does it all:
-
-- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
-  URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  on a schedule. A fresh default list is rebuilt **every Monday** by GitHub Actions and
-  published at a stable URL, so pasting this once keeps a device current on its own:
-  `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin`
-- **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
-  device verifies it and reboots into the new image. Or push over WiFi from the CLI:
-  ```bash
-  pio run -t upload --upload-port c3adblock.local --upload-protocol espota
-  ```
-
-**4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
-blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
-single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
-
-## Security
-
-The dashboard's read-only view (`/`, `/stats.json`) stays open, but every
-state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
-`secrets.h`):
-
-- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
-- `/upload`, `/update` (blocklist and firmware OTA)
-- `/setupdate`, `/fetchnow`
-
-Network OTA (`ArduinoOTA`, e.g. `pio run -t upload --upload-port c3adblock.local
---upload-protocol espota`) requires `OTA_PASS` from the same file.
-
-Without this, anyone who could reach the device on the LAN could reflash it
-with arbitrary firmware or rewrite the blocklist with zero credentials — worth
-knowing given the device sits in the path of every DNS query on your network.
-Custom blocked-domain names are also HTML-escaped before being rendered on the
-dashboard, closing a stored-XSS path where a domain string containing markup
-(added via `/addblock`) would otherwise execute in the viewing browser.
-
-**Basic Auth here is a LAN-trust-boundary control, not encryption.** Everything
-is plain HTTP on :80 — this chip has no realistic budget to run a TLS server.
-Basic Auth credentials are base64 (not encrypted) and sent on every authenticated
-request; anyone who can already sniff your LAN traffic (open/guest WiFi, ARP
-spoofing) can read them off the wire. This hardens against the common case —
-another device on your network hitting the API with no credentials at all, or a
-browser tab CSRF'ing it — not against an on-path network attacker.
-
-**CSRF via cached Basic Auth:** browsers auto-attach cached Basic Auth
-credentials to *any* subsequent request to an already-authenticated origin —
-including one triggered by a totally unrelated page the same browser visits
-later (e.g. `<img src="http://c3adblock.local/forgetwifi">`, no JS required).
-That would let any webpage silently drive this API once you've logged into the
-dashboard once, regardless of who's on your LAN. Every mutating endpoint above
-now also requires a custom `X-Requested-With: c3-adblock` header, which a plain
-`<img>`/auto-submitted `<form>` CSRF can't attach (only same-origin `fetch()`
-can, which is what the dashboard's own JS does) — this is why `/forgetwifi` is
-no longer a bare URL you can visit directly; use the dashboard button instead.
-
-**Default credentials:** if `secrets.h` still has the placeholder
-`CHANGE_ME_WEB_PASSWORD` / `CHANGE_ME_OTA_PASSWORD` values from
-`secrets.example.h`, the device boots with a "password" that's public (it's
-sitting in this repo's example file). The firmware logs a warning over serial
-and shows a banner on the dashboard when this is the case — but it will still
-boot and run, so don't skip setting real values in `secrets.h` before trusting
-this on a network you don't fully control.
-
-Out of scope for now: the WiFi setup portal's access point (`C3-AdBlock-XXXX`)
-is still open (unencrypted) by design — it needs to be joinable without knowing
-a password first. The real WiFi password you type into the portal is only as
-safe as that local radio link during the brief setup window.
-
-## Use it
-
-Point a device's DNS at the C3's IP, or add it as a **secondary resolver** behind
-your main DNS. Test:
+Build for the ESP32-C6:
 
 ```bash
-dig @<c3-ip> doubleclick.net   # -> 0.0.0.0  (blocked)
-dig @<c3-ip> github.com        # -> real IP  (forwarded)
-```
-
-## Gotchas (learned the hard way)
-
-- **ModemManager** (default on Fedora/Ubuntu) grabs `/dev/ttyACM0` and toggles
-  DTR/RTS, which **resets the C3** and blocks serial. Fix:
-  ```bash
-  sudo systemctl stop ModemManager
-  echo 'ATTRS{idVendor}=="303a", ENV{ID_MM_DEVICE_IGNORE}="1"' | sudo tee /etc/udev/rules.d/99-esp-no-modemmanager.rules
-  sudo udevadm control --reload-rules && sudo udevadm trigger
-  ```
-- The C3's USB-Serial-JTAG console can swallow early boot output until the host
-  connects (`while(!Serial)` helps).
-- DNS clients add an **EDNS OPT** record; a blocked reply must contain only the
-  question + answer (ANCOUNT=1, NSCOUNT=ARCOUNT=0) or it's malformed.
-
-## Done / how it could grow
-
-- ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
-- ✅ mDNS (`c3adblock.local`) for discovery
-- ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
-- ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
-- ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
-- ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
-
-## Credits
-
-Inspired by [s60sc/ESP32_AdBlocker](https://github.com/s60sc/ESP32_AdBlocker) — the
-"answer 0.0.0.0 for blocklisted domains" idea. This is an independent from-scratch
-implementation focused on the hash-in-flash optimization for PSRAM-less chips.
-
-## ESP32-C6-Pico port (this branch)
-
-This branch adapts the project for the **Waveshare ESP32-C6-Pico** (ESP32-C6-MINI-1, 4 MB flash, no PSRAM).
-
-- PlatformIO env: `c6` (`board = esp32-c6-devkitm-1`, the closest available board definition; flash size 4 MB matches).
-- USB console: native USB Serial/JTAG (`ARDUINO_USB_MODE=1`, `ARDUINO_USB_CDC_ON_BOOT=1`).
-- BOOT button: GPIO9 (verified against the Waveshare schematic).
-- Partition layout enlarged app slots to 1.5 MB each (toolchain produces ~1.42 MB firmware); blocklist partition ~0.94 MB (~188k domains).
-- mDNS/AP/OTA host renamed to `c6adblock` / `C6-AdBlock`.
-
-### macOS build & flash
-
-```bash
-# 1. secrets
-cp src/secrets.example.h src/secrets.h   # then edit
-
-# 2. blocklist
-python3 tools/build_blocklist.py data/blocklist.bin
-
-# 3. build
 pio run -e c6
+```
 
-# 4. find port
+Other supported environments:
+
+```bash
+pio run -e c3        # original ESP32-C3 target
+pio run -e esp32dev  # classic ESP32
+```
+
+A successful build ends with `SUCCESS` and reports RAM and flash usage. The C6 firmware is written to `.pio/build/c6/firmware.bin`.
+
+## Flash the firmware
+
+Identify the serial port:
+
+```bash
 pio device list
+```
 
-# 5. flash (confirm port first; never auto-flash)
+On macOS the Waveshare board appears as `/dev/cu.usbmodemXXXX` (USB JTAG/serial debug unit). On Windows it appears as a `COM` port. Use the actual port reported by your system; do not guess.
+
+Upload firmware:
+
+```bash
 pio run -e c6 -t upload --upload-port /dev/cu.usbmodemXXXX
+```
 
-# 6. filesystem (blocklist)
-pio run -e c6 -t uploadfs --upload-port /dev/cu.usbmodemXXXX
+If upload fails, hold BOOT, press and release RESET, then release BOOT to enter download mode, and retry.
 
-# 7. monitor
+Open the serial monitor:
+
+```bash
 pio device monitor -p /dev/cu.usbmodemXXXX -b 115200
 ```
 
-### Router DNS
+The startup output includes the assigned IP address and the dashboard URL.
 
-USB power does **not** configure router DNS. Point clients (or the router's DHCP DNS option) at the board's IP, e.g. `192.168.x.x`. Test:
-`dig @<board-ip> doubleclick.net` (expect 0.0.0.0), `dig @<board-ip> github.com` (real IP).
+## Upload LittleFS and the blocklist
 
-### Safe test plan
-1. Flash and boot; confirm `c6adblock.local` dashboard loads.
-2. `dig @<ip> doubleclick.net` → 0.0.0.0; `dig @<ip> github.com` → real IP.
-3. Add a custom block domain via dashboard; verify sinkhole.
-4. Disconnect/reconnect WiFi; confirm recovery and no crash.
-5. OTA: upload a rebuilt firmware.bin via dashboard; confirm reboot.
+Firmware and filesystem are separate artifacts. The blocklist lives in the LittleFS partition.
 
-### Known limitations
-- Board ID is the Espressif devkit (Waveshare not yet in PlatformIO); flash size assumed 4 MB (verify with `esptool flash_id`).
-- Blocklist capacity reduced to ~188k domains due to larger firmware.
-- Plain HTTP dashboard on :80 (LAN trust boundary, as upstream).
+Build the filesystem image (includes the default blocklist if `data/blocklist.bin` exists):
 
-## License
+```bash
+pio run -e c6 -t uploadfs --upload-port /dev/cu.usbmodemXXXX
+```
 
-MIT — see [LICENSE](LICENSE).
+Generate the default blocklist first if needed:
+
+```bash
+python3 tools/build_blocklist.py data/blocklist.bin
+```
+
+This downloads the StevenBlack hosts list and Hagezi Light list and produces a sorted 40-bit hash blob. The default build contains roughly 119,000 domains and is about 0.57 MB. The upstream list licenses apply to the generated data.
+
+Confirm the blocklist loaded by checking the serial output for `blocklist: N domains (valid)` or the dashboard's domain count. If `/blocklist.bin` is missing or invalid, filtering is disabled and all queries are forwarded.
+
+You can also upload a new blocklist later through the dashboard's Blocklist upload form without reflashing.
+
+## First startup
+
+On boot the device prints `[c6-adblock] booting`, the reset reason, and blocklist status. If Wi-Fi is unconfigured it starts the captive portal. Otherwise it connects to the configured network and prints its IP address and `dashboard: http://c6adblock.local`.
+
+mDNS makes the device reachable as `c6adblock.local` on most networks.
+
+## Verify DNS blocking
+
+Query the device directly:
+
+```bash
+dig @<device-ip> doubleclick.net A +noedns
+dig @<device-ip> googlesyndication.com A +noedns
+dig @<device-ip> freeconvert.com A +noedns
+```
+
+Expected: blocked domains resolve to `0.0.0.0`; ordinary domains resolve to real IP addresses. Exact blocklist contents depend on the generated list.
+
+Test EDNS:
+
+```bash
+dig @<device-ip> example.com A +bufsize=1232
+```
+
+These tests query the ESP32 directly. Normal devices on your network will not use it until you configure their DNS settings.
+
+## Configure devices to use the ESP32
+
+Set a device's DNS server to the ESP32's IP address, or set your router's DHCP DNS option to that IP. The ESP32 must be powered and connected to Wi-Fi for DNS to work; if it is unavailable, clients that depend on it will lose DNS.
+
+Recommended: assign a DHCP reservation to the ESP32 so its IP does not change.
+
+Note that DNS-over-HTTPS and other encrypted DNS methods in browsers or operating systems can bypass local DNS filtering.
+
+On macOS, set DNS in System Settings -> Network -> (interface) -> Details -> DNS.
+
+On Windows, set DNS in Settings -> Network & Internet -> (adapter) -> DNS server assignment.
+
+On Android, set DNS in Wi-Fi network details -> IP settings -> Static.
+
+## Dashboard
+
+Address: `http://c6adblock.local` or `http://<device-ip>`.
+
+Visible statistics: total blocked, total allowed, blocklist size, client count, Wi-Fi RSSI, temperature, free RAM, uptime, and per-client blocked/allowed counts.
+
+State-changing endpoints (ban, add block, upload, OTA, settings) require HTTP Basic Authentication using `WEB_USER` and `WEB_PASS` from `src/secrets.h`, plus an `X-Requested-With: c3-adblock` header. Read-only views (`/`, `/stats.json`) are open.
+
+## Troubleshooting
+
+- Device not detected over USB: use a data-capable cable; try BOOT+RESET to enter download mode.
+- Upload failures: confirm the port, reduce upload speed, or enter download mode manually.
+- Wi-Fi connection failures: check credentials, 2.4 GHz availability, and RSSI; use the captive portal.
+- Missing or invalid blocklist: serial shows `blocklist: MISSING` or `INVALID`; run `uploadfs` or upload via dashboard.
+- DNS timeouts: check Wi-Fi stability, upstream reachability, and that the device is not overloaded.
+- Domains not blocked: verify the domain is in the generated list; parent matching covers subdomains only.
+- DNS requests bypassing the ESP32: check client/router DNS settings and DNS-over-HTTPS.
+- EDNS issues: the device handles EDNS forwarding; blocked replies drop the OPT record, which is standards-compliant.
+
+## Security and privacy
+
+- `src/secrets.h` is gitignored; never commit real credentials.
+- Placeholder `WEB_PASS` or `OTA_PASS` values trigger a serial warning and dashboard banner.
+- Dashboard traffic is plain HTTP on port 80; Basic Auth credentials are base64-encoded and visible to anyone who can sniff LAN traffic.
+- OTA and dashboard mutating endpoints require authentication and a CSRF header.
+- The access point used for provisioning is open by design during the setup window.
+
+## Limitations
+
+DNS filtering cannot reliably remove every advertisement. Ads served from first-party domains, certain video platforms, and content delivered over HTTPS from the same domain as legitimate content may not be blocked. This project does not perform HTTPS inspection or content filtering.
+
+## Development and testing
+
+Build:
+
+```bash
+pio run -e c6
+```
+
+Unit tests:
+
+```bash
+python3 -m unittest discover -s tools -p 'test_*.py' -v
+```
+
+Report bugs at https://github.com/neohackt/esp32-c6-adblock/issues.
+
+## License and attribution
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+It is adapted from the ESP32-C3 project by M-Abozaid: https://github.com/M-Abozaid/esp32-c3-adblock. Original copyright and attribution are preserved in the LICENSE file.
+
+## Tested environment
+
+| Component | Version |
+|---|---|
+| macOS | 27.0.1 (arm64) |
+| PlatformIO Core | 6.2.0 |
+| espressif32 platform | 8.0.0 |
+| Arduino framework | 3.x (ESP32-C6) |
+| Python | 3.15 |
+| Waveshare ESP32-C6-Pico | ESP32-C6FH4, 4 MB flash |
+
+Unverified functionality is marked as such in the Features section.
