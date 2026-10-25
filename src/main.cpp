@@ -1,6 +1,6 @@
-// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
+// C6 AdBlock — DNS sinkhole + web dashboard for the ESP32-C6 (no PSRAM).
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
-// Dashboard at http://c3adblock.local : per-client stats, system info,
+// Dashboard at http://c6adblock.local : per-client stats, system info,
 // ban clients, add custom block domains. All control state persisted to flash.
 
 #include <Arduino.h>
@@ -17,6 +17,8 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -41,7 +43,8 @@ WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
-uint8_t buf[1536];   // fits any non-fragmented UDP reply (EDNS answers can exceed 512)
+uint8_t buf[4096];   // fits larger EDNS replies (was 1536; enlarged for DNSSEC/EDNS)
+uint8_t upBuf[4096]; // separate buffer for upstream replies (avoids clobbering pending state)
 
 // first-level flash index (sorted sample hashes) + small direct-mapped cache
 static uint8_t blIndex[INDEX_ENTRIES][HASH_BYTES];
@@ -51,6 +54,22 @@ static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
 struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+
+// Asynchronous DNS forwarding state. Each pending slot owns one in-flight upstream
+// query so the main loop never blocks waiting for a reply.
+struct PendingDns {
+  bool inUse = false;
+  uint32_t clientIp = 0;
+  uint16_t clientPort = 0;
+  Dev* client = nullptr;
+  uint16_t origTxid = 0;
+  uint16_t upTxid = 0;
+  uint8_t qname[256];   // saved question section (name+type+class) for matching/reply
+  int qlen = 0;        // length of saved question section
+  uint32_t startMs = 0;
+};
+static const int MAX_PENDING_DNS = 8;
+static PendingDns pendingDns[MAX_PENDING_DNS];
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -74,6 +93,9 @@ String      portalOpts;             // <option> list of scanned networks, built 
 // blocking pause (Pi-hole-style "disable for a while")
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
+
+// WiFi recovery state
+uint32_t lastWifiCheckMs = 0;
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -233,61 +255,161 @@ static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
 }
-static int buildBlocked(int qend, uint16_t qtype) {
+static int buildBlocked(int qend, uint16_t qtype, int qlen) {
+  if (qend < 12 || qend > qlen || qend > (int)sizeof(buf)) return 0;
   buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
   if (qtype != 1) return qend;
+  if (qend + 16 > (int)sizeof(buf)) return 0;
   const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
-  memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  memcpy(buf + qend, ans, sizeof(ans)); return qend + (int)sizeof(ans);
 }
-// Forward to upstream and wait for the reply that actually belongs to THIS query.
-// Issue #10: after one timeout the late reply used to sit in the socket and get relayed
-// to the next client (every answer shifted by one). Now: drain stale datagrams first,
-// send with a fresh random txid, and only accept a reply whose txid, question section,
-// and source address/port match. The client's own txid is restored on the way back.
-static int forwardUpstream(int qlen, int qend) {
-  upstreamCli.flush();                                   // release any half-read buffer
-  while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
-  const uint8_t cid0 = buf[0], cid1 = buf[1];
-  const uint16_t wid = (uint16_t)esp_random();
-  uint8_t q[260]; int ql = qend - 12;
-  const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
-  if (haveQ) memcpy(q, buf + 12, ql);
-  buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-  const uint32_t t0 = millis();
-  while (millis() - t0 < 1000) {                         // deadline, not a retry count
-    int sz = upstreamCli.parsePacket();
-    if (sz <= 0) { delay(1); continue; }
-    const bool fromUp = upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT;
-    int n = upstreamCli.read(buf, sizeof(buf));
-    upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-    if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
-    if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
-    if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
-    buf[0] = cid0; buf[1] = cid1;
-    return n;
+// Asynchronous upstream forwarding helpers. No blocking waits: send and return.
+static int allocPending() {
+  for (int i = 0; i < MAX_PENDING_DNS; i++) if (!pendingDns[i].inUse) return i;
+  return -1;
+}
+static uint16_t genUpTxid() {
+  // avoid collisions with in-use slots
+  for (int tries = 0; tries < 16; tries++) {
+    uint16_t t = (uint16_t)esp_random();
+    bool clash = false;
+    for (int i = 0; i < MAX_PENDING_DNS; i++) if (pendingDns[i].inUse && pendingDns[i].upTxid == t) { clash = true; break; }
+    if (!clash) return t;
   }
-  return 0;
+  return (uint16_t)esp_random();
 }
-// Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
-// one packet per loop iteration. Returns true if any query was handled this call.
+static void freePending(int idx) { if (idx >= 0 && idx < MAX_PENDING_DNS) { pendingDns[idx].inUse = false; pendingDns[idx].qlen = 0; } }
+
+// Send a SERVFAIL response to the original client for a pending query.
+static void sendServFail(const PendingDns& p) {
+  uint8_t out[512];
+  int o = 0;
+  // header: txid, flags SERVFAIL (0x8182), qdcount=1, an/ns/ar=0
+  out[o++] = p.origTxid >> 8; out[o++] = p.origTxid & 0xFF;
+  out[o++] = 0x81; out[o++] = 0x82;
+  out[o++] = 0; out[o++] = 1;
+  out[o++] = 0; out[o++] = 0;
+  out[o++] = 0; out[o++] = 0;
+  out[o++] = 0; out[o++] = 0;
+  // question section
+  if (p.qlen > 0 && o + p.qlen <= (int)sizeof(out)) {
+    memcpy(out + o, p.qname, p.qlen); o += p.qlen;
+  }
+  if (o > 12) {
+    dnsServer.beginPacket(IPAddress(p.clientIp), p.clientPort);
+    dnsServer.write(out, o);
+    dnsServer.endPacket();
+  }
+}
+
+// Poll upstream for replies and dispatch to clients. Nonblocking.
+static void pollUpstreamDns() {
+  // expire stale pending queries
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_PENDING_DNS; i++) {
+    if (!pendingDns[i].inUse) continue;
+    if (now - pendingDns[i].startMs < 1000) continue;
+    // timeout -> SERVFAIL (do not count as allowed)
+    sendServFail(pendingDns[i]);
+    freePending(i);
+  }
+
+  while (true) {
+    int sz = upstreamCli.parsePacket();
+    if (sz <= 0) break;
+    const bool fromUp = (upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT);
+    int n = upstreamCli.read(upBuf, sizeof(upBuf));
+    upstreamCli.flush();
+    if (!fromUp || n < 12 || sz > (int)sizeof(upBuf)) continue;
+    uint16_t upTxid = (upBuf[0] << 8) | upBuf[1];
+    // find pending
+    int idx = -1;
+    for (int i = 0; i < MAX_PENDING_DNS; i++) {
+      if (!pendingDns[i].inUse || pendingDns[i].upTxid != upTxid) continue;
+      // match question section
+      int ql = pendingDns[i].qlen;
+      if (ql > 0 && (n < 12 + ql || memcmp(upBuf + 12, pendingDns[i].qname, ql) != 0)) continue;
+      idx = i; break;
+    }
+    if (idx < 0) continue; // unknown/stale
+    // restore original txid
+    upBuf[0] = pendingDns[idx].origTxid >> 8;
+    upBuf[1] = pendingDns[idx].origTxid & 0xFF;
+    // send to client
+    dnsServer.beginPacket(IPAddress(pendingDns[idx].clientIp), pendingDns[idx].clientPort);
+    dnsServer.write(upBuf, n);
+    dnsServer.endPacket();
+    if (pendingDns[idx].client) pendingDns[idx].client->allowed++;
+    totalAllowed++;
+    freePending(idx);
+  }
+}
+
+// Start an async upstream forward. Returns true if queued/sent.
+static bool startForward(int qlen, int qend, IPAddress cip, uint16_t cport, Dev* c, uint16_t origTxid) {
+  int slot = allocPending();
+  if (slot < 0) {
+    // capacity exhausted: send SERVFAIL
+    uint8_t out[512]; int o = 0;
+    out[o++]=origTxid>>8; out[o++]=origTxid&0xFF;
+    out[o++]=0x81; out[o++]=0x82;
+    out[o++]=0; out[o++]=1; out[o++]=0; out[o++]=0; out[o++]=0; out[o++]=0; out[o++]=0; out[o++]=0;
+    int ql = qend - 12;
+    if (ql > 0 && ql <= (int)sizeof(out)-o && qend <= qlen) { memcpy(out+o, buf+12, ql); o += ql; }
+    if (o > 12) { dnsServer.beginPacket(cip, cport); dnsServer.write(out, o); dnsServer.endPacket(); }
+    return false;
+  }
+  int ql = qend - 12;
+  bool haveQ = (ql > 0 && ql <= (int)sizeof(pendingDns[slot].qname) && qend <= qlen);
+  if (haveQ) memcpy(pendingDns[slot].qname, buf + 12, ql);
+  pendingDns[slot].qlen = haveQ ? ql : 0;
+  pendingDns[slot].clientIp = (uint32_t)cip;
+  pendingDns[slot].clientPort = cport;
+  pendingDns[slot].client = c;
+  pendingDns[slot].origTxid = origTxid;
+  pendingDns[slot].upTxid = genUpTxid();
+  pendingDns[slot].startMs = millis();
+  pendingDns[slot].inUse = true;
+
+  // send to upstream with upTxid
+  uint8_t saved0 = buf[0], saved1 = buf[1];
+  buf[0] = pendingDns[slot].upTxid >> 8;
+  buf[1] = pendingDns[slot].upTxid & 0xFF;
+  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT);
+  upstreamCli.write(buf, qlen);
+  upstreamCli.endPacket();
+  buf[0] = saved0; buf[1] = saved1;
+  return true;
+}
+// Handle DNS without blocking. Process at most a few packets per call so the
+// dashboard, WiFi and watchdog keep running. Returns true if work was done.
 static bool handleDns() {
   bool did = false;
-  for (int budget = 0; budget < 16; budget++) {
+  for (int budget = 0; budget < 4; budget++) {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
+    if (sz > (int)sizeof(buf)) { dnsServer.flush(); continue; } // oversized datagram
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13 || qlen > (int)sizeof(buf)) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+    // validate qend
+    if (qend < 12 || qend > qlen) continue;
+    if (dl == 0) continue; // malformed/empty question -> drop
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    if (blocked) {
+      int rlen = buildBlocked(qend, qtype, qlen);
+      totalBlocked++; if (c) c->blocked++;
+      if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    } else {
+      uint16_t origTxid = (buf[0] << 8) | buf[1];
+      startForward(qlen, qend, cip, cport, c, origTxid);
+    }
   }
+  // dispatch any upstream replies (nonblocking)
+  pollUpstreamDns();
   return did;
 }
 
@@ -321,7 +443,7 @@ static void handleStats() {
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
-             ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
+             ",\"domains\":" + numHashes + ",\"filtering\":" + (numHashes > 0 ? "true" : "false") + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
@@ -443,7 +565,9 @@ static bool fetchBlocklist(String url) {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
   bool https = url.startsWith("https");
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  esp_task_wdt_reset();
   int code = http.GET();
+  esp_task_wdt_reset();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
   beginBlocklistSwap();
   File f = LittleFS.open("/blocklist.new", "w");
@@ -454,6 +578,7 @@ static bool fetchBlocklist(String url) {
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
     else { if (millis() - idle > 15000) break; delay(2); }
+    esp_task_wdt_reset();
   }
   f.close(); http.end();
   bool ok = commitNewBlocklist();
@@ -480,6 +605,7 @@ static void handleFwUpload() {
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (!fwAuthOk) return;
     if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+    esp_task_wdt_reset();
   } else if (u.status == UPLOAD_FILE_END) {
     if (!fwAuthOk) return;
     if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
@@ -509,17 +635,32 @@ static bool connectWiFi() {
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); esp_task_wdt_reset(); }
   Serial.println();
   return WiFi.status() == WL_CONNECTED;
+}
+
+static void ensureWiFi() {
+  uint32_t now = millis();
+  if (now - lastWifiCheckMs < 10000) return;
+  lastWifiCheckMs = now;
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.println("[wifi] disconnected, attempting reconnect");
+  WiFi.disconnect();
+  delay(100);
+  if (!connectWiFi()) {
+    Serial.println("[wifi] reconnect failed; will retry");
+  } else {
+    Serial.printf("[wifi] reconnected: %s (RSSI %d)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  }
 }
 
 static void handlePortalRoot() {
   String html =
     "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>C3 AdBlock setup</title>"
+    "<title>C6 AdBlock setup</title>"
     "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
-    "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
+    "<h2>&#128737; C6 AdBlock &mdash; WiFi setup</h2>"
     "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
     "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
@@ -535,16 +676,17 @@ static void handleWifiSave() {
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
                              "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
-                             "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
+                             "Reconnect your phone to your normal WiFi, then find the box at <b>c6adblock.local</b>.</body>");
   delay(900); ESP.restart();
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
 static void startConfigPortal() {
   int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
+  esp_task_wdt_reset();
   portalOpts = "";
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
   uint8_t mac[6]; WiFi.macAddress(mac);
-  char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
+  char ap[24]; snprintf(ap, sizeof(ap), "C6-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
@@ -560,6 +702,7 @@ static void startConfigPortal() {
   uint32_t t0 = millis();
   while (true) {
     dnsPortal.processNextRequest(); web.handleClient(); delay(2);
+    esp_task_wdt_reset();
     if (WiFi.softAPgetStationNum() > 0) t0 = millis();          // someone is setting it up
     if (configured && millis() - t0 > 180000UL) { Serial.println("[setup] retrying WiFi"); ESP.restart(); }
   }
@@ -567,20 +710,38 @@ static void startConfigPortal() {
 
 void setup() {
   Serial.begin(115200); delay(300);
-  Serial.println("\n[c3-adblock] booting");
+  Serial.println("\n[c6-adblock] booting");
+  Serial.printf("[diag] reset reason: %d\n", (int)esp_reset_reason());
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
+    size_t sz = blocklist.size();
+    if (sz > 0 && (sz % HASH_BYTES) == 0) {
+      numHashes = sz / HASH_BYTES;
+      Serial.printf("blocklist: %lu domains (valid)\n", (unsigned long)numHashes);
+      buildFlashIndex();
+    } else {
+      Serial.printf("blocklist: INVALID size %u (not multiple of %d)\n", (unsigned)sz, HASH_BYTES);
+      blocklist.close(); blocklist = File(); numHashes = 0;
+    }
+  } else {
+    Serial.println("blocklist: MISSING (/blocklist.bin) - filtering disabled (fail-open)");
+    numHashes = 0;
   }
+  if (numHashes == 0) Serial.println("[diag] filtering NOT active (empty/missing/invalid blocklist)");
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
+  // Task watchdog: reset system if loop stalls > 8s.
+  esp_task_wdt_config_t twdt_config = { .timeout_ms = 8000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_init(&twdt_config);
+  esp_task_wdt_add(NULL); // subscribe current (loop) task
+  Serial.println("[diag] Task watchdog enabled (8s)");
+
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
-#if CONFIG_IDF_TARGET_ESP32C3
-  const int BOOT_PIN = 9;     // C3 BOOT button
+  // C3 and C6 both use GPIO9 as the BOOT/strapping button. Classic ESP32 uses 0.
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6)
+  const int BOOT_PIN = 9;     // C3/C6 BOOT button (GPIO9 strapping pin)
 #else
   const int BOOT_PIN = 0;     // classic ESP32 BOOT button (GPIO9 is a flash pin there)
 #endif
@@ -591,7 +752,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
+  if (MDNS.begin("c6adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c6adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
     Serial.println("[WARN] secrets.h still has placeholder WEB_PASS/OTA_PASS — those are public "
@@ -624,21 +785,32 @@ void setup() {
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
-  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+  ArduinoOTA.setHostname("c6adblock");   // pio run -t upload --upload-port c6adblock.local
   ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
 
+static uint32_t lastDiagMs = 0;
 void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+  ensureWiFi();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
   }
+  // periodic diagnostics (every 60s)
+  uint32_t now = millis();
+  if (now - lastDiagMs >= 60000) {
+    lastDiagMs = now;
+    Serial.printf("[diag] heap=%lu minFree=%lu temp=%.1f wifi=%d rssi=%d blocked=%lu allowed=%lu pending=%d\n",
+      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(), temperatureRead(), (int)WiFi.status(), WiFi.RSSI(),
+      (unsigned long)totalBlocked, (unsigned long)totalAllowed, [](){ int n=0; for(int i=0;i<MAX_PENDING_DNS;i++) if(pendingDns[i].inUse) n++; return n;}());
+  }
+  esp_task_wdt_reset();
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }
